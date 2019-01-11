@@ -3,7 +3,6 @@ using System.Linq;
 using Microsoft.Extensions.Logging;
 using NBitcoin;
 using Stratis.Bitcoin.Consensus;
-using Stratis.Bitcoin.Features.Consensus.Interfaces;
 using Stratis.Bitcoin.Features.Consensus.Rules.CommonRules;
 using Stratis.Bitcoin.Features.MemoryPool;
 using Stratis.Bitcoin.Features.MemoryPool.Interfaces;
@@ -276,7 +275,7 @@ namespace Stratis.Bitcoin.Features.Miner
         /// <summary>
         /// Method for how to add transactions to a block.
         /// Add transactions based on feerate including unconfirmed ancestors
-        /// Increments nPackagesSelected / nDescendantsUpdated with corresponding
+        /// Increments nPackagesSelected / descendantsUpdated with corresponding
         /// statistics from the package selection (for logging statistics).
         /// This transaction selection algorithm orders the mempool based
         /// on feerate of a transaction including all unconfirmed ancestors.
@@ -289,10 +288,10 @@ namespace Stratis.Bitcoin.Features.Miner
         /// mapModifiedTxs with the next transaction in the mempool to decide what
         /// transaction package to work on next.
         /// </summary>
-        protected virtual void AddTransactions(out int nPackagesSelected, out int nDescendantsUpdated)
+        protected virtual void AddTransactions(out int packagesIncludedInBlock, out int descendantsUpdated)
         {
-            nPackagesSelected = 0;
-            nDescendantsUpdated = 0;
+            packagesIncludedInBlock = 0;
+            descendantsUpdated = 0;
 
             // mapModifiedTx will store sorted packages after they are modified
             // because some of their txs are already in the block.
@@ -302,7 +301,7 @@ namespace Stratis.Bitcoin.Features.Miner
             // mapModifiedTxRes.Select(s => new TxMemPoolModifiedEntry(s)).OrderBy(o => o, new CompareModifiedEntry());
 
             // Keep track of entries that failed inclusion, to avoid duplicate work.
-            var failedTx = new TxMempool.SetEntries();
+            var mempoolEntriesNotToInclude = new TxMempool.SetEntries();
 
             // Start by adding all descendants of previously added txs to mapModifiedTx
             // and modifying them for their already included ancestors.
@@ -310,13 +309,13 @@ namespace Stratis.Bitcoin.Features.Miner
 
             List<TxMempoolEntry> ancestorScoreList = this.MempoolLock.ReadAsync(() => this.Mempool.MapTx.AncestorScore).ConfigureAwait(false).GetAwaiter().GetResult().ToList();
 
-            TxMempoolEntry iter;
+            TxMempoolEntry mempoolEntryToInclude;
 
-            int nConsecutiveFailed = 0;
+            int consecutiveFailed = 0;
             while (ancestorScoreList.Any() || mapModifiedTx.Any())
             {
-                TxMempoolEntry mi = ancestorScoreList.FirstOrDefault();
-                if (mi != null)
+                TxMempoolEntry mempoolEntry = ancestorScoreList.FirstOrDefault();
+                if (mempoolEntry != null)
                 {
                     // Skip entries in mapTx that are already in a block or are present
                     // in mapModifiedTx (which implies that the mapTx ancestor state is
@@ -329,142 +328,150 @@ namespace Stratis.Bitcoin.Features.Miner
                     // cached size/sigops/fee values that are not actually correct.
 
                     // First try to find a new transaction in mapTx to evaluate.
-                    if (mapModifiedTx.ContainsKey(mi.TransactionHash) || this.inBlock.Contains(mi) || failedTx.Contains(mi))
+                    if (mapModifiedTx.ContainsKey(mempoolEntry.TransactionHash) || this.inBlock.Contains(mempoolEntry) || mempoolEntriesNotToInclude.Contains(mempoolEntry))
                     {
-                        ancestorScoreList.Remove(mi);
+                        ancestorScoreList.Remove(mempoolEntry);
                         continue;
                     }
                 }
 
-                // Now that mi is not stale, determine which transaction to evaluate:
+                // Now that mempoolEntry is not stale, determine which transaction to evaluate:
                 // the next entry from mapTx, or the best from mapModifiedTx?
-                bool fUsingModified = false;
-                TxMemPoolModifiedEntry modit;
+                bool includeModifiedEntry = false;
+                TxMemPoolModifiedEntry modifiedEntry;
                 var compare = new CompareModifiedEntry();
-                if (mi == null)
+                if (mempoolEntry == null)
                 {
-                    modit = mapModifiedTx.Values.OrderBy(o => o, compare).First();
-                    iter = modit.MempoolEntry;
-                    fUsingModified = true;
+                    modifiedEntry = mapModifiedTx.Values.OrderBy(o => o, compare).First();
+                    mempoolEntryToInclude = modifiedEntry.MempoolEntry;
+                    includeModifiedEntry = true;
                 }
                 else
                 {
                     // Try to compare the mapTx entry to the mapModifiedTx entry
-                    iter = mi;
+                    mempoolEntryToInclude = mempoolEntry;
 
-                    modit = mapModifiedTx.Values.OrderBy(o => o, compare).FirstOrDefault();
-                    if ((modit != null) && (compare.Compare(modit, new TxMemPoolModifiedEntry(iter)) < 0))
+                    modifiedEntry = mapModifiedTx.Values.OrderBy(o => o, compare).FirstOrDefault();
+                    if ((modifiedEntry != null) && (compare.Compare(modifiedEntry, new TxMemPoolModifiedEntry(mempoolEntryToInclude)) < 0))
                     {
                         // The best entry in mapModifiedTx has higher score
                         // than the one from mapTx..
                         // Switch which transaction (package) to consider.
 
-                        iter = modit.MempoolEntry;
-                        fUsingModified = true;
+                        mempoolEntryToInclude = modifiedEntry.MempoolEntry;
+                        includeModifiedEntry = true;
                     }
                     else
                     {
                         // Either no entry in mapModifiedTx, or it's worse than mapTx.
                         // Increment mi for the next loop iteration.
-                        ancestorScoreList.Remove(iter);
+                        ancestorScoreList.Remove(mempoolEntryToInclude);
                     }
                 }
 
                 // We skip mapTx entries that are inBlock, and mapModifiedTx shouldn't
                 // contain anything that is inBlock.
-                Guard.Assert(!this.inBlock.Contains(iter));
+                Guard.Assert(!this.inBlock.Contains(mempoolEntryToInclude));
 
-                long packageSize = iter.SizeWithAncestors;
-                Money packageFees = iter.ModFeesWithAncestors;
-                long packageSigOpsCost = iter.SigOpCostWithAncestors;
-                if (fUsingModified)
+                long packageSizeWithAncestors = mempoolEntryToInclude.SizeWithAncestors;
+                Money packageFeeWithAncestors = mempoolEntryToInclude.ModFeesWithAncestors;
+                long packageSigOpCostWithAncestors = mempoolEntryToInclude.SigOpCostWithAncestors;
+
+                if (includeModifiedEntry)
                 {
-                    packageSize = modit.SizeWithAncestors;
-                    packageFees = modit.ModFeesWithAncestors;
-                    packageSigOpsCost = modit.SigOpCostWithAncestors;
+                    packageSizeWithAncestors = modifiedEntry.SizeWithAncestors;
+                    packageFeeWithAncestors = modifiedEntry.ModFeesWithAncestors;
+                    packageSigOpCostWithAncestors = modifiedEntry.SigOpCostWithAncestors;
                 }
 
-                if (packageFees < this.BlockMinFeeRate.GetFee((int)packageSize))
+                if (packageFeeWithAncestors < this.BlockMinFeeRate.GetFee((int)packageSizeWithAncestors))
                 {
                     // Everything else we might consider has a lower fee rate
                     return;
                 }
 
-                if (!this.TestPackage(iter, packageSize, packageSigOpsCost))
+                if (!this.TestPackage(mempoolEntryToInclude, packageSizeWithAncestors, packageSigOpCostWithAncestors))
                 {
-                    if (fUsingModified)
+                    if (includeModifiedEntry)
                     {
                         // Since we always look at the best entry in mapModifiedTx,
                         // we must erase failed entries so that we can consider the
                         // next best entry on the next loop iteration
-                        mapModifiedTx.Remove(modit.MempoolEntry.TransactionHash);
-                        failedTx.Add(iter);
+                        mapModifiedTx.Remove(modifiedEntry.MempoolEntry.TransactionHash);
+
+                        mempoolEntriesNotToInclude.Add(mempoolEntryToInclude);
                     }
 
-                    nConsecutiveFailed++;
+                    consecutiveFailed++;
 
-                    if ((nConsecutiveFailed > MaxConsecutiveAddTransactionFailures) && (this.BlockWeight > this.Options.BlockMaxWeight - 4000))
+                    if ((consecutiveFailed > MaxConsecutiveAddTransactionFailures) && (this.BlockWeight > this.Options.BlockMaxWeight - 4000))
                     {
                         // Give up if we're close to full and haven't succeeded in a while
                         break;
                     }
+
                     continue;
                 }
 
-                var ancestors = new TxMempool.SetEntries();
-                long nNoLimit = long.MaxValue;
-                string dummy;
+                var mempoolEntriesToInclude = new TxMempool.SetEntries();
 
-                this.MempoolLock.ReadAsync(() =>  this.Mempool.CalculateMemPoolAncestors(iter, ancestors, nNoLimit, nNoLimit, nNoLimit, nNoLimit, out dummy, false)).ConfigureAwait(false).GetAwaiter().GetResult();
+                string errorString;
 
-                this.OnlyUnconfirmed(ancestors);
-                ancestors.Add(iter);
+                this.MempoolLock.ReadAsync(() => this.Mempool.CalculateMemPoolAncestors(mempoolEntryToInclude, mempoolEntriesToInclude, long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue, out errorString, false)).ConfigureAwait(false).GetAwaiter().GetResult();
+
+                this.RemoveConfirmedEntries(mempoolEntriesToInclude);
+
+                mempoolEntriesToInclude.Add(mempoolEntryToInclude);
 
                 // Test if all tx's are Final.
-                if (!this.TestPackageTransactions(ancestors))
+                if (!this.TestPackageTransactions(mempoolEntriesToInclude))
                 {
-                    if (fUsingModified)
+                    if (includeModifiedEntry)
                     {
-                        mapModifiedTx.Remove(modit.MempoolEntry.TransactionHash);
-                        failedTx.Add(iter);
+                        mapModifiedTx.Remove(modifiedEntry.MempoolEntry.TransactionHash);
+
+                        mempoolEntriesNotToInclude.Add(mempoolEntryToInclude);
                     }
+
                     continue;
                 }
 
-                // This transaction will make it in; reset the failed counter.
-                nConsecutiveFailed = 0;
+                // This transaction will make it in, reset the failed counter.
+                consecutiveFailed = 0;
 
                 // Package can be added. Sort the entries in a valid order.
-                // Sort package by ancestor count
-                // If a transaction A depends on transaction B, then A's ancestor count
-                // must be greater than B's.  So this is sufficient to validly order the
+                // Sort package by ancestor count.
+                // If transaction A depends on transaction B, then A's ancestor count
+                // must be greater than B's. So this is sufficient to validly order the
                 // transactions for block inclusion.
-                List<TxMempoolEntry> sortedEntries = ancestors.ToList().OrderBy(o => o, new CompareTxIterByAncestorCount()).ToList();
-                foreach (TxMempoolEntry sortedEntry in sortedEntries)
+                List<TxMempoolEntry> sortedMempoolEntriesToInclude = mempoolEntriesToInclude.ToList().OrderBy(o => o, new CompareTxIterByAncestorCount()).ToList();
+                foreach (TxMempoolEntry sortedMempoolEntry in sortedMempoolEntriesToInclude)
                 {
-                    this.AddToBlock(sortedEntry);
+                    this.AddToBlock(sortedMempoolEntry);
+
                     // Erase from the modified set, if present
-                    mapModifiedTx.Remove(sortedEntry.TransactionHash);
+                    mapModifiedTx.Remove(sortedMempoolEntry.TransactionHash);
                 }
 
-                nPackagesSelected++;
+                packagesIncludedInBlock++;
 
                 // Update transactions that depend on each of these
-                nDescendantsUpdated += this.UpdatePackagesForAdded(ancestors, mapModifiedTx);
+                descendantsUpdated += this.UpdatePackagesForAdded(mempoolEntriesToInclude, mapModifiedTx);
             }
         }
 
         /// <summary>
         /// Remove confirmed <see cref="inBlock"/> entries from given set.
         /// </summary>
-        private void OnlyUnconfirmed(TxMempool.SetEntries testSet)
+        /// <param name="mempoolEntrySet">The set of mempool entries to remove confirmed transactions from.</param>
+        private void RemoveConfirmedEntries(TxMempool.SetEntries mempoolEntrySet)
         {
-            foreach (TxMempoolEntry setEntry in testSet.ToList())
+            foreach (TxMempoolEntry mempoolEntry in mempoolEntrySet.ToList())
             {
                 // Only test txs not already in the block
-                if (this.inBlock.Contains(setEntry))
+                if (this.inBlock.Contains(mempoolEntry))
                 {
-                    testSet.Remove(setEntry);
+                    mempoolEntrySet.Remove(mempoolEntry);
                 }
             }
         }
@@ -530,30 +537,48 @@ namespace Stratis.Bitcoin.Features.Miner
         /// state updated assuming given transactions are inBlock. Returns number
         /// of updated descendants.
         /// </summary>
-        private int UpdatePackagesForAdded(TxMempool.SetEntries alreadyAdded, Dictionary<uint256, TxMemPoolModifiedEntry> mapModifiedTx)
+        /// <param name="addedEntries">The set of mempool entries that been added to the block.</param>
+        /// <param name="mapModifiedTx">A sorted set modified mempool entries.</param>
+        /// <returns>The amount of mempool entry descendants that have been updated from each entry in the set of added mempool entries.</returns>
+        private int UpdatePackagesForAdded(TxMempool.SetEntries addedEntries, Dictionary<uint256, TxMemPoolModifiedEntry> mapModifiedTx)
         {
             int descendantsUpdated = 0;
-            foreach (TxMempoolEntry setEntry in alreadyAdded)
+
+            foreach (TxMempoolEntry addedEntry in addedEntries)
             {
-                var setEntries = new TxMempool.SetEntries();
-                this.MempoolLock.ReadAsync(() => this.Mempool.CalculateDescendants(setEntry, setEntries)).GetAwaiter().GetResult();
-                foreach (TxMempoolEntry desc in setEntries)
+                var descendantsForAddedEntry = new TxMempool.SetEntries();
+
+                this.MempoolLock.ReadAsync(() =>
                 {
-                    if (alreadyAdded.Contains(desc))
+                    if (!this.Mempool.MapTx.ContainsKey(addedEntry.TransactionHash))
+                    {
+                        this.logger.LogWarning("{0} is not present in {1} any longer, skipping.", addedEntry.TransactionHash, nameof(this.Mempool.MapTx));
+                        return;
+                    }
+
+                    this.Mempool.CalculateDescendants(addedEntry, descendantsForAddedEntry);
+
+                }).GetAwaiter().GetResult();
+
+                foreach (TxMempoolEntry descendant in descendantsForAddedEntry)
+                {
+                    if (addedEntries.Contains(descendant))
                         continue;
 
                     descendantsUpdated++;
-                    TxMemPoolModifiedEntry modEntry;
-                    if (!mapModifiedTx.TryGetValue(desc.TransactionHash, out modEntry))
+
+                    TxMemPoolModifiedEntry modifiedEntry;
+
+                    if (!mapModifiedTx.TryGetValue(descendant.TransactionHash, out modifiedEntry))
                     {
-                        modEntry = new TxMemPoolModifiedEntry(desc);
-                        mapModifiedTx.Add(desc.TransactionHash, modEntry);
-                        this.logger.LogDebug("Added transaction '{0}' to the block template because it's a required ancestor for '{1}'.", desc.TransactionHash, setEntry.TransactionHash);
+                        modifiedEntry = new TxMemPoolModifiedEntry(descendant);
+                        mapModifiedTx.Add(descendant.TransactionHash, modifiedEntry);
+                        this.logger.LogDebug("Added transaction '{0}' to the block template because it's a required ancestor for '{1}'.", descendant.TransactionHash, addedEntry.TransactionHash);
                     }
 
-                    modEntry.SizeWithAncestors -= setEntry.GetTxSize();
-                    modEntry.ModFeesWithAncestors -= setEntry.ModifiedFee;
-                    modEntry.SigOpCostWithAncestors -= setEntry.SigOpCost;
+                    modifiedEntry.SizeWithAncestors -= addedEntry.GetTxSize();
+                    modifiedEntry.ModFeesWithAncestors -= addedEntry.ModifiedFee;
+                    modifiedEntry.SigOpCostWithAncestors -= addedEntry.SigOpCost;
                 }
             }
 

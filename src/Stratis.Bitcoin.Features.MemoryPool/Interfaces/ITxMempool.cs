@@ -64,10 +64,10 @@ namespace Stratis.Bitcoin.Features.MemoryPool.Interfaces
         void ApplyDeltas(uint256 hash, ref double dPriorityDelta, ref Money nFeeDelta);
 
         /// <summary>
-        /// Calculates descendants of entry that are not already in setDescendants, and adds to setDecendants.
+        /// Calculates descendants of entry that are not already in setDescendants and adds to setDecendants.
         /// </summary>
         /// <param name="entry">Memory pool entry.</param>
-        /// <param name="setDescendants">Set of entry decendants to add to.</param>
+        /// <param name="descendantsForEntry">Set of entry decendants to add to.</param>
         /// <remarks>
         /// Assumes entryit is already a tx in the mempool and setMemPoolChildren
         /// is correct for tx and all descendants.
@@ -75,7 +75,7 @@ namespace Stratis.Bitcoin.Features.MemoryPool.Interfaces
         /// in-mempool descendants of it are already in setDescendants as well, so that we
         /// can save time by not iterating over those entries.
         /// </remarks>
-        void CalculateDescendants(TxMempoolEntry entry, TxMempool.SetEntries setDescendants);
+        void CalculateDescendants(TxMempoolEntry entry, TxMempool.SetEntries descendantsForEntry);
 
         /// <summary>
         /// Try to calculate all in-mempool ancestors of entry.

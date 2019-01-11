@@ -29,8 +29,6 @@ namespace Stratis.Bitcoin.Features.MemoryPool
         public long FeeDelta { get; set; }
     }
 
-;
-
     /// <summary>
     /// Memory pool of pending transactions.
     /// </summary>
@@ -231,7 +229,6 @@ namespace Stratis.Bitcoin.Features.MemoryPool
             ++this.nTransactionsUpdated;
         }
 
-
         /// <inheritdoc />
         public void Clear()
         {
@@ -314,7 +311,7 @@ namespace Stratis.Bitcoin.Features.MemoryPool
             string dummy;
             this.CalculateMemPoolAncestors(entry, setAncestors, nNoLimit, nNoLimit, nNoLimit, nNoLimit, out dummy);
             bool returnVal = this.AddUnchecked(hash, entry, setAncestors, validFeeEstimate);
-            
+
             return returnVal;
         }
 
@@ -428,28 +425,29 @@ namespace Stratis.Bitcoin.Features.MemoryPool
         private SetEntries GetMemPoolParents(TxMempoolEntry entry)
         {
             Guard.NotNull(entry, nameof(entry));
-
             Guard.Assert(this.MapTx.ContainsKey(entry.TransactionHash));
-            TxLinks it = this.mapLinks.TryGet(entry);
-            Guard.Assert(it != null);
 
-            return it.Parents;
+            TxLinks txLink = this.mapLinks.TryGet(entry);
+            Guard.Assert(txLink != null);
+
+            return txLink.Parents;
         }
 
         /// <summary>
         /// Gets the children of a memory pool entry.
         /// </summary>
-        /// <param name="entry">Memory pool entry.</param>
+        /// <param name="mempoolEntry">Memory pool entry.</param>
         /// <returns>Set of child entries.</returns>
-        private SetEntries GetMemPoolChildren(TxMempoolEntry entry)
+        private SetEntries GetMemPoolChildren(TxMempoolEntry mempoolEntry)
         {
-            Guard.NotNull(entry, nameof(entry));
+            Guard.NotNull(mempoolEntry, nameof(mempoolEntry));
+            Guard.Assert(this.MapTx.ContainsKey(mempoolEntry.TransactionHash));
 
-            Guard.Assert(this.MapTx.ContainsKey(entry.TransactionHash));
-            TxLinks it = this.mapLinks.TryGet(entry);
-            Guard.Assert(it != null);
-            
-            return it.Children;
+            TxLinks txLinks = this.mapLinks.TryGet(mempoolEntry);
+
+            Guard.Assert(txLinks != null);
+
+            return txLinks.Children;
         }
 
         /// <summary>
@@ -579,7 +577,7 @@ namespace Stratis.Bitcoin.Features.MemoryPool
                     }
                 }
             }
-            
+
             return true;
         }
 
@@ -593,7 +591,7 @@ namespace Stratis.Bitcoin.Features.MemoryPool
                     return false;
                 }
             }
-            
+
             return true;
         }
 
@@ -671,7 +669,7 @@ namespace Stratis.Bitcoin.Features.MemoryPool
                 this.CalculateDescendants(removeit, stage);
             }
             this.RemoveStaged(stage, false);
-            
+
             return stage.Count;
         }
 
@@ -710,28 +708,30 @@ namespace Stratis.Bitcoin.Features.MemoryPool
         }
 
         /// <inheritdoc />
-        public void CalculateDescendants(TxMempoolEntry entry, SetEntries setDescendants)
+        public void CalculateDescendants(TxMempoolEntry entry, SetEntries descendantsForEntry)
         {
             var stage = new SetEntries();
-            if (!setDescendants.Contains(entry))
+            if (!descendantsForEntry.Contains(entry))
             {
                 stage.Add(entry);
             }
+
             // Traverse down the children of entry, only adding children that are not
             // accounted for in setDescendants already (because those children have either
             // already been walked, or will be walked in this iteration).
             while (stage.Any())
             {
-                TxMempoolEntry it = stage.First();
-                setDescendants.Add(it);
-                stage.Remove(it);
+                TxMempoolEntry mempoolEntry = stage.First();
 
-                SetEntries setChildren = this.GetMemPoolChildren(it);
-                foreach (TxMempoolEntry childiter in setChildren)
+                descendantsForEntry.Add(mempoolEntry);
+                stage.Remove(mempoolEntry);
+
+                SetEntries descendantEntries = this.GetMemPoolChildren(mempoolEntry);
+                foreach (TxMempoolEntry descendantEntry in descendantEntries)
                 {
-                    if (!setDescendants.Contains(childiter))
+                    if (!descendantsForEntry.Contains(descendantEntry))
                     {
-                        stage.Add(childiter);
+                        stage.Add(descendantEntry);
                     }
                 }
             }
@@ -878,7 +878,7 @@ namespace Stratis.Bitcoin.Features.MemoryPool
         /// </summary>
         /// <param name="hash">Transaction hash.</param>
         private void ClearPrioritisation(uint256 hash)
-        { 
+        {
             //LOCK(cs);
             this.mapDeltas.Remove(hash);
         }
