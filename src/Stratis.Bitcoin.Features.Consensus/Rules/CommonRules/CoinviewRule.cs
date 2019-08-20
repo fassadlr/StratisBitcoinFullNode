@@ -34,102 +34,112 @@ namespace Stratis.Bitcoin.Features.Consensus.Rules.CommonRules
         /// <inheritdoc />
         public override async Task RunAsync(RuleContext context)
         {
-            Block block = context.ValidationContext.BlockToValidate;
-            ChainedHeader index = context.ValidationContext.ChainedHeaderToValidate;
-            DeploymentFlags flags = context.Flags;
-            UnspentOutputSet view = (context as UtxoRuleContext).UnspentOutputSet;
+            if (context.SkipValidation)
+            {
+                this.UpdateCoinViewOnly(context);
+                return;
+            }
+            else
+                await UpdateCoinViewWithValidationAsync((UtxoRuleContext)context);
+        }
 
+        private void UpdateCoinViewOnly(RuleContext context)
+        {
+            foreach (var transaction in context.ValidationContext.BlockToValidate.Transactions)
+            {
+                this.UpdateCoinView(context, transaction);
+            }
+
+            this.Logger.LogDebug("BIP68, SigOp cost, and block reward validation skipped for block at height {0}.", context.ValidationContext.ChainedHeaderToValidate.Height);
+        }
+
+        private async Task UpdateCoinViewWithValidationAsync(UtxoRuleContext context)
+        {
             long sigOpsCost = 0;
-            Money fees = Money.Zero;
+            Money totalFees = Money.Zero;
             var inputsToCheck = new List<(Transaction tx, int inputIndexCopy, TxOut txOut, PrecomputedTransactionData txData, TxIn input, DeploymentFlags flags)>();
 
-            for (int txIndex = 0; txIndex < block.Transactions.Count; txIndex++)
+            foreach (var transaction in context.ValidationContext.BlockToValidate.Transactions)
             {
-                Transaction tx = block.Transactions[txIndex];
-
-                if (!context.SkipValidation)
+                // Check Inputs
+                if (!transaction.IsCoinBase && !context.UnspentOutputSet.HaveInputs(transaction))
                 {
-                    if (!tx.IsCoinBase && !view.HaveInputs(tx))
+                    this.Logger.LogDebug("Transaction '{0}' has not inputs", transaction.GetHash());
+                    this.Logger.LogTrace("(-)[BAD_TX_NO_INPUT]");
+                    ConsensusErrors.BadTransactionMissingInput.Throw();
+                }
+
+                // Check finality
+                if (!this.IsTxFinal(transaction, context))
+                {
+                    this.Logger.LogDebug("Transaction '{0}' is not final", transaction.GetHash());
+                    this.Logger.LogTrace("(-)[BAD_TX_NON_FINAL]");
+                    ConsensusErrors.BadTransactionNonFinal.Throw();
+                }
+
+                // Check SigOpsCost
+                // GetTransactionSignatureOperationCost counts 3 types of sigops:
+                // * legacy (always),
+                // * p2sh (when P2SH enabled in flags and excludes coinbase),
+                // * witness (when witness enabled in flags and excludes coinbase).
+                sigOpsCost += this.GetTransactionSignatureOperationCost(transaction, context.UnspentOutputSet, context.Flags);
+                if (sigOpsCost > this.ConsensusOptions.MaxBlockSigopsCost)
+                {
+                    this.Logger.LogTrace("(-)[BAD_BLOCK_SIG_OPS]");
+                    ConsensusErrors.BadBlockSigOps.Throw();
+                }
+
+                if (!transaction.IsCoinBase)
+                {
+                    this.CheckInputs(transaction, context.UnspentOutputSet, context.ValidationContext.ChainedHeaderToValidate.Height);
+
+                    totalFees += this.GetTransactionFee(context.UnspentOutputSet, transaction);
+
+                    var txData = new PrecomputedTransactionData(transaction);
+                    for (int inputIndex = 0; inputIndex < transaction.Inputs.Count; inputIndex++)
                     {
-                        this.Logger.LogDebug("Transaction '{0}' has not inputs", tx.GetHash());
-                        this.Logger.LogTrace("(-)[BAD_TX_NO_INPUT]");
-                        ConsensusErrors.BadTransactionMissingInput.Throw();
-                    }
+                        TxIn input = transaction.Inputs[inputIndex];
 
-                    if (!this.IsTxFinal(tx, context))
-                    {
-                        this.Logger.LogDebug("Transaction '{0}' is not final", tx.GetHash());
-                        this.Logger.LogTrace("(-)[BAD_TX_NON_FINAL]");
-                        ConsensusErrors.BadTransactionNonFinal.Throw();
-                    }
-
-                    // GetTransactionSignatureOperationCost counts 3 types of sigops:
-                    // * legacy (always),
-                    // * p2sh (when P2SH enabled in flags and excludes coinbase),
-                    // * witness (when witness enabled in flags and excludes coinbase).
-                    sigOpsCost += this.GetTransactionSignatureOperationCost(tx, view, flags);
-                    if (sigOpsCost > this.ConsensusOptions.MaxBlockSigopsCost)
-                    {
-                        this.Logger.LogTrace("(-)[BAD_BLOCK_SIG_OPS]");
-                        ConsensusErrors.BadBlockSigOps.Throw();
-                    }
-
-                    if (!tx.IsCoinBase)
-                    {
-                        this.CheckInputs(tx, view, index.Height);
-
-                        fees += this.GetTransactionFee(view, tx);
-
-                        var txData = new PrecomputedTransactionData(tx);
-                        for (int inputIndex = 0; inputIndex < tx.Inputs.Count; inputIndex++)
-                        {
-                            TxIn input = tx.Inputs[inputIndex];
-
-                            inputsToCheck.Add((
-                                tx: tx,
-                                inputIndexCopy: inputIndex,
-                                txOut: view.GetOutputFor(input),
-                                txData,
-                                input: input,
-                                flags
-                            ));
-                        }
+                        inputsToCheck.Add((
+                            tx: transaction,
+                            inputIndexCopy: inputIndex,
+                            txOut: context.UnspentOutputSet.GetOutputFor(input),
+                            txData,
+                            input: input,
+                            context.Flags
+                        ));
                     }
                 }
 
-                this.UpdateCoinView(context, tx);
+                this.UpdateCoinView(context, transaction);
             }
 
-            if (!context.SkipValidation)
+            this.CheckBlockReward(context, totalFees, context.ValidationContext.ChainedHeaderToValidate.Height, context.ValidationContext.BlockToValidate);
+
+            // Start the Parallel loop on a thread so its result can be awaited rather than blocking
+            var checkInputsInParallel = Task.Run(() =>
             {
-                this.CheckBlockReward(context, fees, index.Height, block);
-
-                // Start the Parallel loop on a thread so its result can be awaited rather than blocking
-                Task<ParallelLoopResult> checkInputsInParallel = Task.Run(() =>
+                return Parallel.ForEach(inputsToCheck, (input, state) =>
                 {
-                    return Parallel.ForEach(inputsToCheck, (input, state) =>
+                    if (state.ShouldExitCurrentIteration)
+                        return;
+
+                    if (!this.CheckInput(input.tx, input.inputIndexCopy, input.txOut, input.txData, input.input, input.flags))
                     {
-                        if (state.ShouldExitCurrentIteration)
-                            return;
-
-                        if (!this.CheckInput(input.tx, input.inputIndexCopy, input.txOut, input.txData, input.input, input.flags))
-                        {
-                            state.Stop();
-                        }
-                    });
-
+                        state.Stop();
+                    }
                 });
 
-                ParallelLoopResult loopResult = await checkInputsInParallel.ConfigureAwait(false);
+            });
 
-                if (!loopResult.IsCompleted)
-                {
-                    this.Logger.LogTrace("(-)[BAD_TX_SCRIPT]");
+            ParallelLoopResult loopResult = await checkInputsInParallel.ConfigureAwait(false);
 
-                    ConsensusErrors.BadTransactionScriptError.Throw();
-                }
+            if (!loopResult.IsCompleted)
+            {
+                this.Logger.LogTrace("(-)[BAD_TX_SCRIPT]");
+
+                ConsensusErrors.BadTransactionScriptError.Throw();
             }
-            else this.Logger.LogDebug("BIP68, SigOp cost, and block reward validation skipped for block at height {0}.", index.Height);
         }
 
         protected abstract Money GetTransactionFee(UnspentOutputSet view, Transaction tx);
@@ -152,15 +162,15 @@ namespace Stratis.Bitcoin.Features.Consensus.Rules.CommonRules
         /// <returns>Whether the input is valid.</returns>
         protected virtual bool CheckInput(Transaction tx, int inputIndexCopy, TxOut txout, PrecomputedTransactionData txData, TxIn input, DeploymentFlags flags)
         {
-            var checker = new TransactionChecker(tx, inputIndexCopy, txout.Value, txData);
-            var ctx = new ScriptEvaluationContext(this.Parent.Network);
-            ctx.ScriptVerify = flags.ScriptFlags;
-            bool verifyScriptResult = ctx.VerifyScript(input.ScriptSig, txout.ScriptPubKey, checker);
-
-            if (verifyScriptResult == false)
+            var txChecker = new TransactionChecker(tx, inputIndexCopy, txout.Value, txData);
+            var scriptEvalContext = new ScriptEvaluationContext(this.Parent.Network)
             {
-                this.Logger.LogDebug("Verify script for transaction '{0}' failed, ScriptSig = '{1}', ScriptPubKey = '{2}', script evaluation error = '{3}'", tx.GetHash(), input.ScriptSig, txout.ScriptPubKey, ctx.Error);
-            }
+                ScriptVerify = flags.ScriptFlags
+            };
+
+            bool verifyScriptResult = scriptEvalContext.VerifyScript(input.ScriptSig, txout.ScriptPubKey, txChecker);
+            if (!verifyScriptResult)
+                this.Logger.LogDebug("Verify script for transaction '{0}' failed, ScriptSig = '{1}', ScriptPubKey = '{2}', script evaluation error = '{3}'", tx.GetHash(), input.ScriptSig, txout.ScriptPubKey, scriptEvalContext.Error);
 
             return verifyScriptResult;
         }
