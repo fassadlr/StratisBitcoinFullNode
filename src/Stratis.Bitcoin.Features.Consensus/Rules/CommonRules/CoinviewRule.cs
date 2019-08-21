@@ -62,20 +62,20 @@ namespace Stratis.Bitcoin.Features.Consensus.Rules.CommonRules
             foreach (var transaction in context.ValidationContext.BlockToValidate.Transactions)
             {
                 // Check Inputs
-                if (!transaction.IsCoinBase && !context.UnspentOutputSet.HaveInputs(transaction))
-                {
-                    this.Logger.LogDebug("Transaction '{0}' has not inputs", transaction.GetHash());
-                    this.Logger.LogTrace("(-)[BAD_TX_NO_INPUT]");
-                    ConsensusErrors.BadTransactionMissingInput.Throw();
-                }
+                //if (!transaction.IsCoinBase && !context.UnspentOutputSet.HaveInputs(transaction))
+                //{
+                //    this.Logger.LogDebug("Transaction '{0}' has not inputs", transaction.GetHash());
+                //    this.Logger.LogTrace("(-)[BAD_TX_NO_INPUT]");
+                //    ConsensusErrors.BadTransactionMissingInput.Throw();
+                //}
 
                 // Check finality
-                if (!this.IsTxFinal(transaction, context))
-                {
-                    this.Logger.LogDebug("Transaction '{0}' is not final", transaction.GetHash());
-                    this.Logger.LogTrace("(-)[BAD_TX_NON_FINAL]");
-                    ConsensusErrors.BadTransactionNonFinal.Throw();
-                }
+                //if (!this.IsTxFinal(transaction, context))
+                //{
+                //    this.Logger.LogDebug("Transaction '{0}' is not final", transaction.GetHash());
+                //    this.Logger.LogTrace("(-)[BAD_TX_NON_FINAL]");
+                //    ConsensusErrors.BadTransactionNonFinal.Throw();
+                //}
 
                 // Check SigOpsCost
                 // GetTransactionSignatureOperationCost counts 3 types of sigops:
@@ -145,10 +145,10 @@ namespace Stratis.Bitcoin.Features.Consensus.Rules.CommonRules
         protected abstract Money GetTransactionFee(UnspentOutputSet view, Transaction tx);
 
         /// <summary>Checks if transaction if final.</summary>
-        protected virtual bool IsTxFinal(Transaction transaction, RuleContext context)
-        {
-            return transaction.IsFinal(context.ValidationContext.ChainedHeaderToValidate);
-        }
+        //protected virtual bool IsTxFinal(Transaction transaction, RuleContext context)
+        //{
+        //    return transaction.IsFinal(context.ValidationContext.ChainedHeaderToValidate);
+        //}
 
         /// <summary>
         /// Verify that an input may be validly spent as part of the given transaction in the given block.
